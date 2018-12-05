@@ -464,6 +464,157 @@ int64_t streamTrimByLength(stream *s, size_t maxlen, int approx) {
     return deleted;
 }
 
+/* Trim the stream 's' of elements with IDs within the range inclusive, and
+ * return the number of elements removed from the stream. The 'approx' option,
+ * if non-zero, specifies that the trimming must be performed in a
+ * approximated way in order to maximize performance. This means that the
+ * stream may contain elements with IDs within the range, and elements are
+ * only removed if we can remove a *whole* node of the radix tree.
+ *
+ * The function may return zero if the stream has no elements within the
+ * specified range or if the range is only within a partial node.
+ */
+int64_t streamTrimByRange(stream *s, streamID *lowest_id, streamID *highest_id, int approx) {
+    /* Setup our iterator and skip ahead until we're in range. If 'approx' is
+     * true we overshoot rather than undershoot since we will only remove
+     * whole nodes. */
+    raxIterator ri;
+    raxStart(&ri,s->rax);
+
+    unsigned char key[sizeof(streamID)];
+    streamEncodeID(key,lowest_id);
+
+    if (!approx) {
+        /* If exact err on undershooting so we always iterate every node that
+         * contains entries within the given range. */
+        raxSeek(&ri,"<=",key,sizeof(key));
+        /* No node immediately prior? */
+        if (raxEOF(&ri))
+            raxSeek(&ri,">=",key,sizeof(key));
+    } else {
+        /* If approximate then err on overshooting since we won't mutate
+         * partial nodes. */
+        raxSeek(&ri,">=",key,sizeof(key));
+    }
+
+    int64_t deleted = 0;
+    while(raxNext(&ri)) {
+        unsigned char *lp = ri.data, *p;
+
+        /* IDs of the left-most and right-most entries in the listpack. */
+        streamID leftmost_id, rightmost_id;
+
+        /* Translate the radix tree key into the left-most id. */
+        streamDecodeID(ri.key,&leftmost_id);
+
+        /* Skip fields backwards to get to ID. */
+        p = lpLast(lp);
+        for (int64_t count = lpGetInteger(p); count; --count)
+            p = lpPrev(lp,p);
+
+        /* Pull out right-most ID. */
+        p = lpNext(lp,p); rightmost_id.ms = lpGetInteger(p) + leftmost_id.ms;
+        p = lpNext(lp,p); rightmost_id.seq = lpGetInteger(p) + leftmost_id.seq;
+
+        /* No way this node can have entries within the range if the
+         * leftmost ID is greater than the highest or if the righmost ID is
+         * lesser than lowest. */
+        if (streamCompareID(&leftmost_id,highest_id) > 0) break;
+        if (streamCompareID(&rightmost_id,lowest_id) < 0) break;
+
+        /* If not completly contained then we'll have to delete entries. */
+        int partial = (streamCompareID(&leftmost_id,lowest_id) < 0)
+                    | (streamCompareID(&rightmost_id,highest_id) > 0);
+
+        if (!partial) {
+            /* Remove the whole node. */
+            lpFree(lp);
+            raxRemove(s->rax,ri.key,ri.key_len,NULL);
+            raxSeek(&ri,">=",ri.key,ri.key_len);
+            int64_t entries = lpGetInteger(lpFirst(lp));
+            s->length -= entries;
+            deleted += entries;
+        } else {
+            /* If we cannot remove a whole node and are only dropping nodes
+             * within the given range then skip to the next node. */
+            if (approx) continue;
+
+            /* Grab counts. */
+            p = lpFirst(lp); int64_t node_count = lpGetInteger(p);
+            p = lpNext(lp,p); int64_t node_deleted = lpGetInteger(p);
+
+            /* Skip master entry and terminator. */
+            p = lpNext(lp,p); int64_t master_fields_count = lpGetInteger(p);
+            for (int64_t count = master_fields_count; count; --count)
+                p = lpNext(lp,p);
+            p = lpNext(lp,p);
+
+            /* Walk every entry and mark them as deleted until we exceed our
+             * range. */
+            while (p) {
+                /* Pull flags.*/
+                p = lpNext(lp,p); int flags = lpGetInteger(p);
+
+                /* Pull out ID. */
+                streamID id;
+                p = lpNext(lp,p); id.ms = lpGetInteger(p) + leftmost_id.ms;
+                p = lpNext(lp,p); id.seq = lpGetInteger(p) + leftmost_id.seq;
+
+                if (streamCompareID(&id,lowest_id) >= 0) {
+                    if (streamCompareID(&id,highest_id) <= 0) {
+                        /* Mark the entry as deleted if not already. */
+                        if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
+                            /* Rewind, replace, and rewalk. */
+                            p = lpPrev(lp,lpPrev(lp,p));
+                            lp = lpReplaceInteger(lp,&p,flags|STREAM_ITEM_FLAG_DELETED);
+                            p = lpNext(lp,lpNext(lp,p));
+
+                            /* Reflect to node counters. */
+                            node_count--;
+                            node_deleted++;
+
+                            /* Adjust stream length to reflect deletion. */
+                            s->length--;
+
+                            /* Count for caller.*/
+                            deleted++;
+                        }
+                    } else {
+                        /* Stop once we're out of range. */
+                        break;
+                    }
+                }
+
+                /* Seek to count (or values if compressed). */
+                p = lpNext(lp,p);
+
+                /* Determine how many fields need to be skipped. */
+                int skip;
+                if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+                    skip = master_fields_count;
+                } else {
+                    skip = lpGetInteger(p);
+                    skip = 1+(skip*2);
+                }
+
+                /* Skip to next entry. */
+                while (skip--) p = lpNext(lp,p);
+            }
+
+            /* Update counters. */
+            p = lpFirst(lp); lp = lpReplaceInteger(lp,&p,node_count);
+            p = lpNext(lp,p); lp = lpReplaceInteger(lp,&p,node_deleted);
+
+            /* Update with the new pointer. */
+            if (ri.data != lp)
+                raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
+        }
+    }
+
+    raxStop(&ri);
+    return deleted;
+}
+
 /* Initialize the stream iterator, so that we can call iterating functions
  * to get the next items. This requires a corresponding streamIteratorStop()
  * at the end. The 'rev' parameter controls the direction. If it's zero the
@@ -1161,6 +1312,15 @@ void streamRewriteApproxMaxlen(client *c, stream *s, int maxlen_arg_idx) {
 
     decrRefCount(equal_obj);
     decrRefCount(maxlen_obj);
+}
+
+/* We propagate approxiate range trims as exact range trims otherwise
+ * trimming is no longer determinsitic on replicas / AOF. */
+void streamRewriteApproxRange(client *c, stream *s, int id_qualifier_idx) {
+    UNUSED(s);
+    robj *equal_obj = createStringObject("=",1);
+    rewriteClientCommandArgument(c,id_qualifier_idx,equal_obj);
+    decrRefCount(equal_obj);
 }
 
 /* XADD key [MAXLEN [~|=] <count>] <ID or *> [field value] [field value] ... */
@@ -2347,10 +2507,14 @@ void xdelCommand(client *c) {
  *                             the specified length. Use ~ before the
  *                             count in order to demand approximated trimming
  *                             (like XADD MAXLEN option).
+ *
+ * RANGE [~|-] <low> <high> -- Trim entries within the given range. Use ~
+  *                            before the IDs in order to demand approximated
+ *                             trimming.
  */
-
 #define TRIM_STRATEGY_NONE 0
 #define TRIM_STRATEGY_MAXLEN 1
+#define TRIM_STRATEGY_RANGE 2
 void xtrimCommand(client *c) {
     robj *o;
 
@@ -2362,10 +2526,16 @@ void xtrimCommand(client *c) {
 
     /* Argument parsing. */
     int trim_strategy = TRIM_STRATEGY_NONE;
+
     long long maxlen = -1;  /* If left to -1 no trimming is performed. */
     int approx_maxlen = 0;  /* If 1 only delete whole radix tree nodes, so
                                the maxium length is not applied verbatim. */
     int maxlen_arg_idx = 0; /* Index of the count in MAXLEN, for rewriting. */
+
+    streamID lowest_id, highest_id;
+    int approx_range = 0;      /* If 1 only delete whole radix tree nodes, so
+                                  the comparison is not applied verbatim. */
+    int id_qualifier_idx = 0;  /* Index of the time in TIME, for rewriting. */
 
     /* Parse options. */
     int i = 2; /* Start of options. */
@@ -2392,6 +2562,32 @@ void xtrimCommand(client *c) {
             }
             i++;
             maxlen_arg_idx = i;
+        } else if (!strcasecmp(opt,"range") && moreargs) {
+            approx_range = 0;
+            trim_strategy = TRIM_STRATEGY_RANGE;
+            char *next = c->argv[i+1]->ptr;
+            /* Check for the form RANGE ~ <low> <high>. */
+            if (moreargs >= 2 && next[0] == '~' && next[1] == '\0') {
+                approx_range = 1;
+                id_qualifier_idx = i++;
+                moreargs--;
+            } else if (moreargs >= 2 && next[0] == '=' && next[1] == '\0') {
+                i++;
+                moreargs--;
+            }
+            if (moreargs < 2) {
+                addReplyError(c,"RANGE requires two arguments.");
+                return;
+            }
+            if (streamParseStrictIDOrReply(c,c->argv[i+1],&lowest_id,0) != C_OK)
+                return;
+            if (streamParseStrictIDOrReply(c,c->argv[i+2],&highest_id,0) != C_OK)
+                return;
+            if (streamCompareID(&lowest_id,&highest_id) > 0) {
+                addReplyError(c,"Lowest ID cannot be greater than highest ID.");
+                return;
+            }
+            i += 2;
         } else {
             addReply(c,shared.syntaxerr);
             return;
@@ -2402,6 +2598,8 @@ void xtrimCommand(client *c) {
     int64_t deleted = 0;
     if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
         deleted = streamTrimByLength(s,maxlen,approx_maxlen);
+    } else if (trim_strategy == TRIM_STRATEGY_RANGE) {
+        deleted = streamTrimByRange(s,&lowest_id,&highest_id,approx_range);
     } else {
         addReplyError(c,"XTRIM called without an option to trim the stream");
         return;
@@ -2413,6 +2611,7 @@ void xtrimCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_STREAM,"xtrim",c->argv[1],c->db->id);
         server.dirty += deleted;
         if (approx_maxlen) streamRewriteApproxMaxlen(c,s,maxlen_arg_idx);
+        if (approx_range) streamRewriteApproxRange(c,s,id_qualifier_idx);
     }
     addReplyLongLong(c,deleted);
 }
